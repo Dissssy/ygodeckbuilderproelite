@@ -1,0 +1,7 @@
+/target
+/assets
+/cache
+/dist
+build.bat
+Cargo.lock
+index.html
