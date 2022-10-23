@@ -66,24 +66,36 @@ pub struct CardSet {
     pub set_price: f32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CardImage {
     pub id: u32,
-    pub image_url: String,
-    // image is lazy loaded, it will be an egui texture id
-    pub image: Option<TextureId>,
-    pub image_url_small: String,
-    pub image_small: Option<TextureId>,
+    pub small: YugiohImage,
+    pub large: YugiohImage,
 }
 
-impl std::fmt::Debug for CardImage {
+#[derive(Clone)]
+pub struct YugiohImage {
+    pub url: String,
+    pub image: Option<TextureId>,
+    pub promise_index: Option<usize>,
+}
+
+impl YugiohImage {
+    pub fn from_raw(url: String) -> Self {
+        Self {
+            url,
+            image: None,
+            promise_index: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for YugiohImage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CardImage")
-            .field("id", &self.id)
-            .field("image_url", &self.image_url)
+            .field("url", &self.url)
             .field("image", &self.image.is_some())
-            .field("image_url_small", &self.image_url_small)
-            .field("image_small", &self.image_small.is_some())
+            .field("promise_index", &self.promise_index)
             .finish()
     }
 }
@@ -125,6 +137,9 @@ impl YugiohCard {
             archetype: raw_card.archetype.unwrap_or_else(|| "None".to_string()),
         }
     }
+    pub fn as_mut(&mut self) -> &mut Self {
+        self
+    }
 }
 
 impl CardSet {
@@ -143,10 +158,8 @@ impl CardImage {
     pub fn from_raw(raw_card_image: RawCardImage) -> Self {
         Self {
             id: raw_card_image.id,
-            image_url: raw_card_image.image_url,
-            image: None,
-            image_url_small: raw_card_image.image_url_small,
-            image_small: None,
+            small: YugiohImage::from_raw(raw_card_image.image_url_small),
+            large: YugiohImage::from_raw(raw_card_image.image_url),
         }
     }
 }
@@ -187,9 +200,7 @@ pub struct YugiohCardSearchCriteria {
 
 impl YugiohCardSearchCriteria {
     pub fn new() -> Self {
-        Self {
-            string: String::new(),
-        }
+        Self { string: String::new() }
     }
 }
 
@@ -197,8 +208,6 @@ impl YugiohCardSearchCriteria {
     pub fn matches(self, card: &YugiohCard) -> bool {
         // check if a card matches the criteria
         // for the time being just check if the name contains the string
-        card.name
-            .to_lowercase()
-            .contains(self.string.to_lowercase().as_str())
+        card.name.to_lowercase().contains(self.string.to_lowercase().as_str())
     }
 }

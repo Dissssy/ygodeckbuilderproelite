@@ -1,10 +1,7 @@
 #[macro_export]
 macro_rules! block {
     ($x:expr) => {{
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
         rt.block_on($x)
     }};
@@ -22,10 +19,7 @@ macro_rules! promisify {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
             rt.block_on(async move { sender.send($future.await) });
         }
