@@ -1,3 +1,7 @@
+#![cfg_attr(all(target_os = "windows", not(feature = "console"),), windows_subsystem = "windows")]
+// suppress warnings about unused code
+#[allow(unused_imports)]
+#[allow(unused_variables)]
 use std::time::Instant;
 
 use eframe::egui::{self, ScrollArea};
@@ -7,18 +11,32 @@ use poll_promise::Promise;
 mod sizedbuffer;
 mod yugioh;
 use sizedbuffer::Buffer;
-use yugioh::{YugiohCard, YugiohCardSearchCriteria, YugiohCards, YugiohDeck};
+use yugioh::{DeckType, YugiohCard, YugiohCardSearchCriteria, YugiohCards, YugiohDeck};
 const CARD_HEIGHT: f32 = 128.0;
 const ASPECT_RATIO: f32 = 2.25 / 3.25;
 const CARD_WIDTH: f32 = CARD_HEIGHT * ASPECT_RATIO;
 const CARD_MARGIN: f32 = 1.0;
-const CARD_ROUNDING: f32 = 2.0;
-const MAX_BUFFER_SIZE: usize = 100;
+const CARD_ROUNDING: f32 = 1.0;
+const MAX_DOWNLOADS: usize = 250;
+
 fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     {
+        // first we make sure the appdata directory for the program exists
+        let appdata = dirs::data_local_dir().unwrap();
+        let appdata = appdata.join("yugiohdeckbuilder");
+        std::fs::create_dir_all(&appdata).unwrap();
+        // then we make sure the cache directory for the program exists
+        let cache = appdata.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        // then we make sure there is a small and large folder in the cache directory
+        let small = cache.join("small");
+        std::fs::create_dir_all(&small).unwrap();
+        let large = cache.join("large");
+        std::fs::create_dir_all(&large).unwrap();
+        let app_dirs = AppDirs { appdata, cache, small, large };
         let native_options = eframe::NativeOptions::default();
-        eframe::run_native("Yugioh Deck Builder", native_options, Box::new(|cc| Box::new(App::new(cc))));
+        eframe::run_native("Yugioh Deck Builder", native_options, Box::new(|cc| Box::new(App::new(cc, app_dirs))));
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -30,6 +48,7 @@ fn main() {
         eframe::start_web("the_canvas_id", web_options, Box::new(|cc| Box::new(App::new(cc)))).expect("Failed to start");
     }
 }
+#[allow(dead_code)]
 pub struct App {
     p: Option<Promise<Vec<YugiohCard>>>,
     cards: Vec<YugiohCard>,
@@ -46,7 +65,17 @@ pub struct App {
     last_sorting: SortingMode,
     request_repaint: bool,
     ppp: f32,
+    app_dirs: AppDirs,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppDirs {
+    pub appdata: std::path::PathBuf,
+    pub cache: std::path::PathBuf,
+    pub small: std::path::PathBuf,
+    pub large: std::path::PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListDisplayMode {
     Card,
@@ -68,18 +97,18 @@ enum Ord {
     Dsc,
 }
 impl App {
-    pub fn new(_: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(_: &eframe::CreationContext<'_>, app_dirs: AppDirs) -> Self {
         App {
             p: None,
             cards: Vec::new(),
-            deck: YugiohDeck::new(),
+            deck: YugiohDeck::new(false),
             list_display_mode: ListDisplayMode::ImageOnly,
             api_override: false,
             search_criteria: YugiohCardSearchCriteria::new(),
             search_results: None,
             last_search_criteria: YugiohCardSearchCriteria::new(),
             cached_images: Vec::new(),
-            image_promises: Buffer::new(MAX_BUFFER_SIZE),
+            image_promises: Buffer::new(MAX_DOWNLOADS),
             buffers: vec![String::new(); 10],
             sorting: SortingMode {
                 stype: SortingType::Name,
@@ -91,6 +120,7 @@ impl App {
             },
             request_repaint: false,
             ppp: 1.0,
+            app_dirs,
         }
     }
 }
@@ -101,11 +131,12 @@ impl eframe::App for App {
             if self.cards.is_empty() {
                 if self.p.is_none() {
                     let api_override = self.api_override;
+                    let app_dirs = self.app_dirs.clone();
                     self.p = Some(Promise::spawn_thread("data", move || {
                         let data: Result<String, anyhow::Error> = if api_override {
                             Err(anyhow::Error::msg("API override"))
                         } else {
-                            let r = std::fs::read_to_string("./cache/data.json");
+                            let r = std::fs::read_to_string(app_dirs.cache.join("cards.json"));
                             if let Ok(data) = r {
                                 Ok(data)
                             } else {
@@ -118,7 +149,7 @@ impl eframe::App for App {
                         } else {
                             let data = reqwest::blocking::get("https://db.ygoprodeck.com/api/v7/cardinfo.php").unwrap().text().unwrap();
                             cards = serde_json::from_str(&data).unwrap();
-                            std::fs::write("./cache/data.json", data).unwrap();
+                            std::fs::write(app_dirs.cache.join("cards.json"), data).unwrap();
                         }
                         let mut parsed_cards = Vec::new();
                         for card in cards.data {
@@ -131,6 +162,9 @@ impl eframe::App for App {
                 }
                 ui.spinner();
             } else {
+                if !self.deck.been_loaded {
+                    self.deck = YugiohDeck::from_file(self.app_dirs.appdata.join("deck.ydk"), &self.cards);
+                }
                 let r = ui.add(egui::Slider::new(&mut self.ppp, 1.0..=10.0).text("pixels per point"));
                 if !r.dragged() {
                     ctx.set_pixels_per_point(self.ppp);
@@ -158,39 +192,24 @@ impl eframe::App for App {
                 if self.search_results.is_none() || self.last_search_criteria != self.search_criteria || self.last_sorting != self.sorting {
                     let criteria = self.search_criteria.clone();
                     let mut c: Vec<(usize, YugiohCard)> = Vec::new();
+                    // let deck = self.deck.clone();
                     for (i, card) in self.cards.iter().enumerate() {
                         if criteria.clone().matches(card) {
+                            // if deck.contains_card(i) != DeckType::None {
+                            //     c.push((i, card.clone()));
+                            // }
                             c.push((i, card.clone()));
                         }
                     }
-
-                    match self.sorting {
-                        SortingMode {
-                            stype: SortingType::Name,
-                            order: Ord::Asc,
-                        } => {
-                            c.sort_by(|a, b| a.1.name.cmp(&b.1.name));
-                        }
-                        SortingMode {
-                            stype: SortingType::Name,
-                            order: Ord::Dsc,
-                        } => {
-                            c.sort_by(|a, b| b.1.name.cmp(&a.1.name));
-                        }
-                        SortingMode {
-                            stype: SortingType::Id,
-                            order: Ord::Asc,
-                        } => {
-                            c.sort_by(|a, b| a.1.id.cmp(&b.1.id));
-                        }
-                        SortingMode {
-                            stype: SortingType::Id,
-                            order: Ord::Dsc,
-                        } => {
-                            c.sort_by(|a, b| b.1.id.cmp(&a.1.id));
-                        }
+                    let sorting = match self.sorting.stype {
+                        SortingType::Name => |a: &(usize, YugiohCard), b: &(usize, YugiohCard)| b.1.name.cmp(&a.1.name),
+                        SortingType::Id => |a: &(usize, YugiohCard), b: &(usize, YugiohCard)| b.1.id.cmp(&a.1.id),
                     };
-                    c.reverse();
+                    if self.sorting.order == Ord::Dsc {
+                        c.sort_by(|a, b| sorting(b, a));
+                    } else {
+                        c.sort_by(sorting);
+                    }
                     self.search_results = Some(c);
                 }
                 ui.separator();
@@ -242,96 +261,40 @@ impl eframe::App for App {
                                             egui::Color32::from_rgb(0, 0, 0),
                                         );
                                         self.request_repaint = true;
-                                        // let im = self.image_promises.get_ref(promise_index);
-                                        // if let Some(im) = im {
-                                        //     if im.poll().is_ready() {
-                                        //         let im = self.image_promises.try_take(promise_index);
-                                        //         if let Some(im) = im {
-                                        //             let im = im.block_and_take();
-                                        //             if let Ok(im) = im {
-                                        //                 card.card_image.small.image = Some(im.texture_id(ctx));
-                                        //                 card.card_image.small.promise_index = None;
-                                        //                 self.cached_images.push(im);
-                                        //             } else {
-                                        //                 eprintln!("Image promise exists but was not fulfilled");
-                                        //             }
-                                        //         } else {
-                                        //             eprintln!("Image promise could not be taken");
-                                        //         }
-                                        //     } else {
-                                        //         //eprintln!("Image promise is not ready");
-                                        //     }
-                                        // } else {
-                                        //     eprintln!("Image promise does not exist");
-                                        //     card.card_image.small.promise_index = None;
-                                        // }
-                                    } else {
-                                        let movecard = card.clone();
-                                        let id = card.id;
-                                        let api_override = self.api_override;
-                                        if self.image_promises.get_index().is_some() {
-                                            let i = self.image_promises.try_add(Promise::spawn_thread(format!("small:{}", card.id), move || {
-                                                let mut traceback = String::new();
-                                                let image_bytes: Result<Vec<u8>, anyhow::Error> = if api_override {
-                                                    Err(anyhow::Error::msg("API override"))
-                                                } else {
-                                                    let r = std::fs::read(format!("./cache/small/{}.cache", id));
-                                                    if let Ok(data) = r {
-                                                        Ok(data)
-                                                    } else {
-                                                        Err(anyhow::Error::msg("Failed to read image"))
-                                                    }
-                                                };
-                                                if let Ok(image_bytes) = image_bytes {
-                                                    let image = RetainedImage::from_image_bytes(format!("small:{}", id), &image_bytes[..]);
-                                                    if let Ok(image) = image {
-                                                        Ok(image)
-                                                    } else {
-                                                        let res = std::fs::remove_file(format!("./cache/small/{}.cache", id));
-                                                        if res.is_ok() {
-                                                            traceback.push_str("Failed to load image bytes\n");
-                                                        } else {
-                                                            traceback.push_str("Failed to load image bytes\nFailed to delete corrupted image from cache\n");
-                                                        }
-                                                        Err(anyhow::anyhow!(traceback))
-                                                    }
-                                                } else {
-                                                    traceback.push_str("Failed to read image from cache, attempting to load from api\n");
-                                                    let image = reqwest::blocking::get(movecard.card_image.small.url.as_str());
-                                                    if let Ok(image) = image {
-                                                        let image_bytes = image.bytes();
-                                                        if let Ok(image_bytes) = image_bytes {
-                                                            let raw_image_bytes = image_bytes.to_vec();
-                                                            let res = std::fs::write(format!("./cache/small/{}.cache", id), &raw_image_bytes);
-                                                            if let Err(res) = res {
-                                                                traceback.push_str(format!("Failed to write image to cache: {}\n", res).as_str());
-                                                            }
-                                                            let image = RetainedImage::from_image_bytes(format!("small:{}", id), &raw_image_bytes.to_vec()[..]);
-                                                            if let Ok(image) = image {
-                                                                Ok(image)
-                                                            } else {
-                                                                traceback.push_str("Failed to load image bytes\n");
-                                                                Err(anyhow::anyhow!(traceback))
-                                                            }
-                                                        } else {
-                                                            traceback.push_str("Failed to read image bytes from api\n");
-                                                            Err(anyhow::anyhow!(traceback))
-                                                        }
-                                                    } else {
-                                                        traceback.push_str("Failed to load image from api\n");
-                                                        Err(anyhow::anyhow!(traceback))
-                                                    }
-                                                }
-                                            }));
-                                            if let Ok(i) = i {
-                                                card.card_image.small.promise_index = Some(i);
-                                            } else {
-                                                eprintln!("Failed to create promise for small image: {}", id);
-                                            }
+                                    // let im = self.image_promises.get_ref(promise_index);
+                                    // if let Some(im) = im {
+                                    //  if im.poll().is_ready() {
+                                    //      let im = self.image_promises.try_take(promise_index);
+                                    //      if let Some(im) = im {
+                                    //       let im = im.block_and_take();
+                                    //       if let Ok(im) = im {
+                                    //           card.card_image.small.image = Some(im.texture_id(ctx));
+                                    //           card.card_image.small.promise_index = None;
+                                    //           self.cached_images.push(im);
+                                    //       } else {
+                                    //           eprintln!("Image promise exists but was not fulfilled");
+                                    //       }
+                                    //      } else {
+                                    //       eprintln!("Image promise could not be taken");
+                                    //      }
+                                    //  } else {
+                                    //      //eprintln!("Image promise is not ready");
+                                    //  }
+                                    // } else {
+                                    //  eprintln!("Image promise does not exist");
+                                    //  card.card_image.small.promise_index = None;
+                                    // }
+                                    } else if self.image_promises.get_index().is_some() {
+                                        let i = self.image_promises.try_add(card.card_image.small.get_promise(self.api_override, self.app_dirs.small.clone()));
+                                        if let Ok(i) = i {
+                                            card.card_image.small.promise_index = Some(i);
                                         } else {
-                                            // eprintln!("Failed to get index for image promise");
+                                            eprintln!("Failed to create promise for small image: {}", card.id);
                                         }
+                                    } else {
+                                        // eprintln!("Failed to get index for image promise");
                                     }
+
                                     if let Some(input_position) = input_position {
                                         if image_rect.contains(input_position) {
                                             card_to_draw = Some((card.clone(), image_rect));
@@ -373,95 +336,38 @@ impl eframe::App for App {
                                                 egui::Color32::from_rgb(0, 0, 0),
                                             );
                                             self.request_repaint = true;
-                                            // let im = self.image_promises.get_ref(promise_index);
-                                            // if let Some(im) = im {
-                                            //     if im.poll().is_ready() {
-                                            //         let im = self.image_promises.try_take(promise_index);
-                                            //         if let Some(im) = im {
-                                            //             let im = im.block_and_take();
-                                            //             if let Ok(im) = im {
-                                            //                 card.card_image.large.image = Some(im.texture_id(ctx));
-                                            //                 card.card_image.large.promise_index = None;
-                                            //                 self.cached_images.push(im);
-                                            //             } else {
-                                            //                 eprintln!("Image promise exists but was not fulfilled");
-                                            //             }
-                                            //         } else {
-                                            //             eprintln!("Image promise could not be taken");
-                                            //         }
-                                            //     } else {
-                                            //         //eprintln!("Image promise is not ready");
-                                            //     }
-                                            // } else {
-                                            //     eprintln!("Image promise does not exist");
-                                            //     card.card_image.large.promise_index = None;
-                                            // }
-                                        } else {
-                                            let movecard = card.clone();
-                                            let id = card.id;
-                                            let api_override = self.api_override;
-                                            if self.image_promises.get_index().is_some() {
-                                                let i = self.image_promises.try_add(Promise::spawn_thread(format!("large:{}", card.id), move || {
-                                                    let mut traceback = String::new();
-                                                    let image_bytes: Result<Vec<u8>, anyhow::Error> = if api_override {
-                                                        Err(anyhow::Error::msg("API override"))
-                                                    } else {
-                                                        let r = std::fs::read(format!("./cache/large/{}.cache", id));
-                                                        if let Ok(data) = r {
-                                                            Ok(data)
-                                                        } else {
-                                                            Err(anyhow::Error::msg("Failed to read image"))
-                                                        }
-                                                    };
-                                                    if let Ok(image_bytes) = image_bytes {
-                                                        let image = RetainedImage::from_image_bytes(format!("large:{}", id), &image_bytes[..]);
-                                                        if let Ok(image) = image {
-                                                            Ok(image)
-                                                        } else {
-                                                            let res = std::fs::remove_file(format!("./cache/large/{}.cache", id));
-                                                            if res.is_ok() {
-                                                                traceback.push_str("Failed to load image bytes\n");
-                                                            } else {
-                                                                traceback.push_str("Failed to load image bytes\nFailed to delete corrupted image from cache\n");
-                                                            }
-                                                            Err(anyhow::anyhow!(traceback))
-                                                        }
-                                                    } else {
-                                                        traceback.push_str("Failed to read image from cache, attempting to load from api\n");
-                                                        let image = reqwest::blocking::get(movecard.card_image.large.url.as_str());
-                                                        if let Ok(image) = image {
-                                                            let image_bytes = image.bytes();
-                                                            if let Ok(image_bytes) = image_bytes {
-                                                                let raw_image_bytes = image_bytes.to_vec();
-                                                                let res = std::fs::write(format!("./cache/large/{}.cache", id), &raw_image_bytes);
-                                                                if let Err(res) = res {
-                                                                    traceback.push_str(format!("Failed to write image to cache: {}\n", res).as_str());
-                                                                }
-                                                                let image = RetainedImage::from_image_bytes(format!("large:{}", id), &raw_image_bytes.to_vec()[..]);
-                                                                if let Ok(image) = image {
-                                                                    Ok(image)
-                                                                } else {
-                                                                    traceback.push_str("Failed to load image bytes\n");
-                                                                    Err(anyhow::anyhow!(traceback))
-                                                                }
-                                                            } else {
-                                                                traceback.push_str("Failed to read image bytes from api\n");
-                                                                Err(anyhow::anyhow!(traceback))
-                                                            }
-                                                        } else {
-                                                            traceback.push_str("Failed to load image from api\n");
-                                                            Err(anyhow::anyhow!(traceback))
-                                                        }
-                                                    }
-                                                }));
-                                                if let Ok(i) = i {
-                                                    card.card_image.large.promise_index = Some(i);
-                                                } else {
-                                                    eprintln!("Failed to create promise for large image: {}", id);
-                                                }
+                                        // let im = self.image_promises.get_ref(promise_index);
+                                        // if let Some(im) = im {
+                                        //  if im.poll().is_ready() {
+                                        //      let im = self.image_promises.try_take(promise_index);
+                                        //      if let Some(im) = im {
+                                        //       let im = im.block_and_take();
+                                        //       if let Ok(im) = im {
+                                        //           card.card_image.large.image = Some(im.texture_id(ctx));
+                                        //           card.card_image.large.promise_index = None;
+                                        //           self.cached_images.push(im);
+                                        //       } else {
+                                        //           eprintln!("Image promise exists but was not fulfilled");
+                                        //       }
+                                        //      } else {
+                                        //       eprintln!("Image promise could not be taken");
+                                        //      }
+                                        //  } else {
+                                        //      //eprintln!("Image promise is not ready");
+                                        //  }
+                                        // } else {
+                                        //  eprintln!("Image promise does not exist");
+                                        //  card.card_image.large.promise_index = None;
+                                        // }
+                                        } else if self.image_promises.get_index().is_some() {
+                                            let i = self.image_promises.try_add(card.card_image.large.get_promise(self.api_override, self.app_dirs.large.clone()));
+                                            if let Ok(i) = i {
+                                                card.card_image.large.promise_index = Some(i);
                                             } else {
-                                                // eprintln!("Failed to get index for image promise");
+                                                eprintln!("Failed to create promise for large image: {}", card.id);
                                             }
+                                        } else {
+                                            // eprintln!("Failed to get index for image promise");
                                         }
                                     }
                                 }
@@ -498,111 +404,71 @@ impl eframe::App for App {
                                                 let index = row * columns + column;
                                                 if index < search_results.len() {
                                                     let card = self.cards[search_results[index].0].as_mut();
+                                                    let indeck = self.deck.contains_card(search_results[index].0);
+                                                    let color = match indeck {
+                                                        DeckType::Main => Some(egui::Color32::from_rgb(255, 255, 0)),
+                                                        DeckType::Side => Some(egui::Color32::from_rgb(0, 255, 255)),
+                                                        DeckType::Extra => Some(egui::Color32::from_rgb(255, 0, 255)),
+                                                        DeckType::None => None,
+                                                    };
+                                                    let (card_image, correct_dir) = if ctx.pixels_per_point() < 3.5 {
+                                                        (&mut card.card_image.small, self.app_dirs.small.clone())
+                                                    } else {
+                                                        (&mut card.card_image.large, self.app_dirs.large.clone())
+                                                    };
+                                                    // let card_image = &mut card.card_image.small;
                                                     let (_id, rect) = ui.allocate_space(egui::Vec2::new((CARD_WIDTH + CARD_MARGIN) * scaling, (CARD_HEIGHT + CARD_MARGIN) * scaling));
                                                     ui.painter()
                                                         .rect(rect, CARD_ROUNDING, egui::Color32::from_rgb(54, 54, 54), egui::Stroke::new(1., egui::Color32::from_rgb(64, 64, 64)));
-                                                    if let Some(image) = card.card_image.small.image {
+                                                    if let Some(image) = card_image.image {
                                                         let mut mesh = egui::Mesh::with_texture(image);
                                                         mesh.add_rect_with_uv(rect, egui::Rect::from_min_max(egui::Pos2::new(0., 0.), egui::Pos2::new(1., 1.)), egui::Color32::WHITE);
                                                         ui.painter().add(egui::Shape::Mesh(mesh));
-                                                    } else if let Some(_promise_index) = card.card_image.small.promise_index {
+                                                    } else if let Some(_promise_index) = card_image.promise_index {
                                                         ui.painter()
                                                             .text(rect.center(), egui::Align2::CENTER_CENTER, "Loading...", egui::FontId::default(), egui::Color32::from_rgb(0, 0, 0));
                                                         self.request_repaint = true;
-                                                        // let im = self.image_promises.get_ref(promise_index);
-                                                        // if let Some(im) = im {
-                                                        //     if im.poll().is_ready() {
-                                                        //         let im = self.image_promises.try_take(promise_index);
-                                                        //         if let Some(im) = im {
-                                                        //             let im = im.block_and_take();
-                                                        //             if let Ok(im) = im {
-                                                        //                 card.card_image.small.image = Some(im.texture_id(ctx));
-                                                        //                 card.card_image.small.promise_index = None;
-                                                        //                 self.cached_images.push(im);
-                                                        //             } else {
-                                                        //                 eprintln!("Image promise exists but was not fulfilled");
-                                                        //             }
-                                                        //         } else {
-                                                        //             eprintln!("Image promise could not be taken");
-                                                        //         }
-                                                        //     } else {
-                                                        //         //eprintln!("Image promise is not ready");
-                                                        //     }
-                                                        // } else {
-                                                        //     eprintln!("Image promise does not exist");
-                                                        //     card.card_image.small.promise_index = None;
-                                                        // }
-                                                    } else {
-                                                        let movecard = card.clone();
-                                                        let id = card.id;
-                                                        let api_override = self.api_override;
-                                                        if self.image_promises.get_index().is_some() {
-                                                            let i = self.image_promises.try_add(Promise::spawn_thread(format!("small:{}", card.id), move || {
-                                                                let mut traceback = String::new();
-                                                                let image_bytes: Result<Vec<u8>, anyhow::Error> = if api_override {
-                                                                    Err(anyhow::Error::msg("API override"))
-                                                                } else {
-                                                                    let r = std::fs::read(format!("./cache/small/{}.cache", id));
-                                                                    if let Ok(data) = r {
-                                                                        Ok(data)
-                                                                    } else {
-                                                                        Err(anyhow::Error::msg("Failed to read image"))
-                                                                    }
-                                                                };
-                                                                if let Ok(image_bytes) = image_bytes {
-                                                                    let image = RetainedImage::from_image_bytes(format!("small:{}", id), &image_bytes[..]);
-                                                                    if let Ok(image) = image {
-                                                                        Ok(image)
-                                                                    } else {
-                                                                        let res = std::fs::remove_file(format!("./cache/small/{}.cache", id));
-                                                                        if res.is_ok() {
-                                                                            traceback.push_str("Failed to load image bytes\n");
-                                                                        } else {
-                                                                            traceback.push_str("Failed to load image bytes\nFailed to delete corrupted image from cache\n");
-                                                                        }
-                                                                        Err(anyhow::anyhow!(traceback))
-                                                                    }
-                                                                } else {
-                                                                    traceback.push_str("Failed to read image from cache, attempting to load from api\n");
-                                                                    let image = reqwest::blocking::get(movecard.card_image.small.url.as_str());
-                                                                    if let Ok(image) = image {
-                                                                        let image_bytes = image.bytes();
-                                                                        if let Ok(image_bytes) = image_bytes {
-                                                                            let raw_image_bytes = image_bytes.to_vec();
-                                                                            let res = std::fs::write(format!("./cache/small/{}.cache", id), &raw_image_bytes);
-                                                                            if let Err(res) = res {
-                                                                                traceback.push_str(format!("Failed to write image to cache: {}\n", res).as_str());
-                                                                            }
-                                                                            let image = RetainedImage::from_image_bytes(format!("small:{}", id), &raw_image_bytes.to_vec()[..]);
-                                                                            if let Ok(image) = image {
-                                                                                Ok(image)
-                                                                            } else {
-                                                                                traceback.push_str("Failed to load image bytes\n");
-                                                                                Err(anyhow::anyhow!(traceback))
-                                                                            }
-                                                                        } else {
-                                                                            traceback.push_str("Failed to read image bytes from api\n");
-                                                                            Err(anyhow::anyhow!(traceback))
-                                                                        }
-                                                                    } else {
-                                                                        traceback.push_str("Failed to load image from api\n");
-                                                                        Err(anyhow::anyhow!(traceback))
-                                                                    }
-                                                                }
-                                                            }));
-                                                            if let Ok(i) = i {
-                                                                card.card_image.small.promise_index = Some(i);
-                                                            } else {
-                                                                eprintln!("Failed to create promise for small image: {}", id);
-                                                            }
+                                                    // let im = self.image_promises.get_ref(promise_index);
+                                                    // if let Some(im) = im {
+                                                    //  if im.poll().is_ready() {
+                                                    //      let im = self.image_promises.try_take(promise_index);
+                                                    //      if let Some(im) = im {
+                                                    //       let im = im.block_and_take();
+                                                    //       if let Ok(im) = im {
+                                                    //           card.card_image.small.image = Some(im.texture_id(ctx));
+                                                    //           card.card_image.small.promise_index = None;
+                                                    //           self.cached_images.push(im);
+                                                    //       } else {
+                                                    //           eprintln!("Image promise exists but was not fulfilled");
+                                                    //       }
+                                                    //      } else {
+                                                    //       eprintln!("Image promise could not be taken");
+                                                    //      }
+                                                    //  } else {
+                                                    //      //eprintln!("Image promise is not ready");
+                                                    //  }
+                                                    // } else {
+                                                    //  eprintln!("Image promise does not exist");
+                                                    //  card.card_image.small.promise_index = None;
+                                                    // }
+                                                    } else if self.image_promises.get_index().is_some() {
+                                                        let i = self.image_promises.try_add(card_image.get_promise(self.api_override, correct_dir));
+                                                        if let Ok(i) = i {
+                                                            card_image.promise_index = Some(i);
                                                         } else {
-                                                            // eprintln!("Failed to get index for image promise");
+                                                            eprintln!("Failed to create promise for small image: {}", card.id);
                                                         }
+                                                    } else {
+                                                        // eprintln!("Failed to get index for image promise");
                                                     }
+
                                                     if let Some(input_position) = input_position {
                                                         if rect.contains(input_position) {
                                                             card_to_draw = Some((card.clone(), rect));
                                                         }
+                                                    }
+                                                    if let Some(color) = color {
+                                                        ui.painter().rect_stroke(rect, CARD_ROUNDING, egui::Stroke::new(1., color));
                                                     }
                                                 }
                                             }
@@ -612,12 +478,17 @@ impl eframe::App for App {
                                         let card = self.cards.iter_mut().find(|c| c.id == card.id).unwrap();
                                         if let Some(input_position) = input_position {
                                             if let Some(image) = card.card_image.large.image {
-                                                let bigimage_rect;
-                                                if input_position.x < ui.available_width() / 2. {
+                                                ui.painter().rect(
+                                                    image_rect,
+                                                    CARD_ROUNDING,
+                                                    egui::Color32::from_rgb(54, 54, 54),
+                                                    egui::Stroke::new(1., egui::Color32::from_rgb(64, 64, 64)),
+                                                );
+                                                let bigimage_rect = if input_position.x < ui.available_width() / 2. {
                                                     let min_x = input_position.x;
                                                     let ui_rect = ui.clip_rect();
                                                     let max_x = ui_rect.max.y * ASPECT_RATIO;
-                                                    bigimage_rect = if max_x < ui_rect.max.x - min_x {
+                                                    if max_x < ui_rect.max.x - min_x {
                                                         let min_y = ui_rect.min.y;
                                                         let max_y = ui_rect.max.y;
                                                         let max_x = input_position.x + ((max_y - min_y) * ASPECT_RATIO);
@@ -632,12 +503,12 @@ impl eframe::App for App {
                                                         let max_x = ui_rect.max.x;
                                                         let min_y = max_y - (max_x - min_x) / ASPECT_RATIO;
                                                         egui::Rect::from_min_max(egui::Pos2::new(min_x, min_y), egui::Pos2::new(max_x, max_y))
-                                                    };
+                                                    }
                                                 } else {
                                                     let max_x = input_position.x;
                                                     let ui_rect = ui.clip_rect();
                                                     let min_x = ui_rect.min.y * ASPECT_RATIO;
-                                                    bigimage_rect = if min_x > ui_rect.min.x - max_x {
+                                                    if min_x > ui_rect.min.x - max_x {
                                                         let min_y = ui_rect.min.y;
                                                         let max_y = ui_rect.max.y;
                                                         let min_x = input_position.x - ((max_y - min_y) * ASPECT_RATIO);
@@ -652,8 +523,8 @@ impl eframe::App for App {
                                                         let min_x = ui_rect.min.x;
                                                         let min_y = max_y - (max_x - min_x) / ASPECT_RATIO;
                                                         egui::Rect::from_min_max(egui::Pos2::new(min_x, min_y), egui::Pos2::new(max_x, max_y))
-                                                    };
-                                                }
+                                                    }
+                                                };
                                                 let mut mesh = egui::Mesh::with_texture(image);
                                                 mesh.add_rect_with_uv(bigimage_rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1., 1.)), egui::Color32::WHITE);
                                                 ui.painter().add(egui::Shape::Mesh(mesh));
@@ -666,95 +537,38 @@ impl eframe::App for App {
                                                     egui::Color32::from_rgb(0, 0, 0),
                                                 );
                                                 self.request_repaint = true;
-                                                // let im = self.image_promises.get_ref(promise_index);
-                                                // if let Some(im) = im {
-                                                //     if im.poll().is_ready() {
-                                                //         let im = self.image_promises.try_take(promise_index);
-                                                //         if let Some(im) = im {
-                                                //             let im = im.block_and_take();
-                                                //             if let Ok(im) = im {
-                                                //                 card.card_image.large.image = Some(im.texture_id(ctx));
-                                                //                 card.card_image.large.promise_index = None;
-                                                //                 self.cached_images.push(im);
-                                                //             } else {
-                                                //                 eprintln!("Image promise exists but was not fulfilled");
-                                                //             }
-                                                //         } else {
-                                                //             eprintln!("Image promise could not be taken");
-                                                //         }
-                                                //     } else {
-                                                //         //eprintln!("Image promise is not ready");
-                                                //     }
-                                                // } else {
-                                                //     eprintln!("Image promise does not exist");
-                                                //     card.card_image.large.promise_index = None;
-                                                // }
-                                            } else {
-                                                let movecard = card.clone();
-                                                let id = card.id;
-                                                let api_override = self.api_override;
-                                                if self.image_promises.get_index().is_some() {
-                                                    let i = self.image_promises.try_add(Promise::spawn_thread(format!("large:{}", card.id), move || {
-                                                        let mut traceback = String::new();
-                                                        let image_bytes: Result<Vec<u8>, anyhow::Error> = if api_override {
-                                                            Err(anyhow::Error::msg("API override"))
-                                                        } else {
-                                                            let r = std::fs::read(format!("./cache/large/{}.cache", id));
-                                                            if let Ok(data) = r {
-                                                                Ok(data)
-                                                            } else {
-                                                                Err(anyhow::Error::msg("Failed to read image"))
-                                                            }
-                                                        };
-                                                        if let Ok(image_bytes) = image_bytes {
-                                                            let image = RetainedImage::from_image_bytes(format!("large:{}", id), &image_bytes[..]);
-                                                            if let Ok(image) = image {
-                                                                Ok(image)
-                                                            } else {
-                                                                let res = std::fs::remove_file(format!("./cache/large/{}.cache", id));
-                                                                if res.is_ok() {
-                                                                    traceback.push_str("Failed to load image bytes\n");
-                                                                } else {
-                                                                    traceback.push_str("Failed to load image bytes\nFailed to delete corrupted image from cache\n");
-                                                                }
-                                                                Err(anyhow::anyhow!(traceback))
-                                                            }
-                                                        } else {
-                                                            traceback.push_str("Failed to read image from cache, attempting to load from api\n");
-                                                            let image = reqwest::blocking::get(movecard.card_image.large.url.as_str());
-                                                            if let Ok(image) = image {
-                                                                let image_bytes = image.bytes();
-                                                                if let Ok(image_bytes) = image_bytes {
-                                                                    let raw_image_bytes = image_bytes.to_vec();
-                                                                    let res = std::fs::write(format!("./cache/large/{}.cache", id), &raw_image_bytes);
-                                                                    if let Err(res) = res {
-                                                                        traceback.push_str(format!("Failed to write image to cache: {}\n", res).as_str());
-                                                                    }
-                                                                    let image = RetainedImage::from_image_bytes(format!("large:{}", id), &raw_image_bytes.to_vec()[..]);
-                                                                    if let Ok(image) = image {
-                                                                        Ok(image)
-                                                                    } else {
-                                                                        traceback.push_str("Failed to load image bytes\n");
-                                                                        Err(anyhow::anyhow!(traceback))
-                                                                    }
-                                                                } else {
-                                                                    traceback.push_str("Failed to read image bytes from api\n");
-                                                                    Err(anyhow::anyhow!(traceback))
-                                                                }
-                                                            } else {
-                                                                traceback.push_str("Failed to load image from api\n");
-                                                                Err(anyhow::anyhow!(traceback))
-                                                            }
-                                                        }
-                                                    }));
-                                                    if let Ok(i) = i {
-                                                        card.card_image.large.promise_index = Some(i);
-                                                    } else {
-                                                        eprintln!("Failed to create promise for large image: {}", id);
-                                                    }
+                                            // let im = self.image_promises.get_ref(promise_index);
+                                            // if let Some(im) = im {
+                                            //     if im.poll().is_ready() {
+                                            //         let im = self.image_promises.try_take(promise_index);
+                                            //         if let Some(im) = im {
+                                            //             let im = im.block_and_take();
+                                            //             if let Ok(im) = im {
+                                            //                 card.card_image.large.image = Some(im.texture_id(ctx));
+                                            //                 card.card_image.large.promise_index = None;
+                                            //                 self.cached_images.push(im);
+                                            //             } else {
+                                            //                 eprintln!("Image promise exists but was not fulfilled");
+                                            //             }
+                                            //         } else {
+                                            //             eprintln!("Image promise could not be taken");
+                                            //         }
+                                            //     } else {
+                                            //         //eprintln!("Image promise is not ready");
+                                            //     }
+                                            // } else {
+                                            //     eprintln!("Image promise does not exist");
+                                            //     card.card_image.large.promise_index = None;
+                                            // }
+                                            } else if self.image_promises.get_index().is_some() {
+                                                let i = self.image_promises.try_add(card.card_image.large.get_promise(self.api_override, self.app_dirs.large.clone()));
+                                                if let Ok(i) = i {
+                                                    card.card_image.large.promise_index = Some(i);
                                                 } else {
-                                                    // eprintln!("Failed to get index for image promise");
+                                                    eprintln!("Failed to create promise for large image: {}", card.id);
                                                 }
+                                            } else {
+                                                // eprintln!("Failed to get index for image promise");
                                             }
                                         }
                                     }
@@ -766,56 +580,19 @@ impl eframe::App for App {
             }
             let mut did = false;
             for card in self.cards.iter_mut() {
-                if let Some(promise_index) = card.card_image.small.promise_index {
-                    did = true;
-                    let im = self.image_promises.get_ref(promise_index);
-                    if let Some(im) = im {
-                        if im.poll().is_ready() {
-                            let im = self.image_promises.try_take(promise_index);
+                let r = card.card_image.check_promises(ctx, &mut self.image_promises, false);
+                for i in r {
+                    if i.0 {
+                        did = true;
+                        if let Ok(im) = i.1 {
                             if let Some(im) = im {
-                                let im = im.block_and_take();
-                                if let Ok(im) = im {
-                                    card.card_image.small.image = Some(im.texture_id(ctx));
-                                    card.card_image.small.promise_index = None;
-                                    self.cached_images.push(im);
-                                } else {
-                                    eprintln!("Image promise exists but was not fulfilled");
-                                }
+                                self.cached_images.push(im);
                             } else {
-                                eprintln!("Image promise could not be taken");
+                                // eprintln!("Image promise exists but was not fulfilled");
                             }
                         } else {
-                            // eprintln!("Image promise is not ready");
+                            eprintln!("{}", i.1.err().unwrap());
                         }
-                    } else {
-                        eprintln!("Image promise does not exist");
-                        card.card_image.small.promise_index = None;
-                    }
-                }
-                if let Some(promise_index) = card.card_image.large.promise_index {
-                    did = true;
-                    let im = self.image_promises.get_ref(promise_index);
-                    if let Some(im) = im {
-                        if im.poll().is_ready() {
-                            let im = self.image_promises.try_take(promise_index);
-                            if let Some(im) = im {
-                                let im = im.block_and_take();
-                                if let Ok(im) = im {
-                                    card.card_image.large.image = Some(im.texture_id(ctx));
-                                    card.card_image.large.promise_index = None;
-                                    self.cached_images.push(im);
-                                } else {
-                                    eprintln!("Image promise exists but was not fulfilled");
-                                }
-                            } else {
-                                eprintln!("Image promise could not be taken");
-                            }
-                        } else {
-                            //eprintln!("Image promise is not ready");
-                        }
-                    } else {
-                        eprintln!("Image promise does not exist");
-                        card.card_image.large.promise_index = None;
                     }
                 }
             }

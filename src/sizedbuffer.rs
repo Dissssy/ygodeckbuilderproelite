@@ -44,6 +44,7 @@ impl<T> Buffer<T> {
             None
         }
     }
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.buffer.clear();
     }
